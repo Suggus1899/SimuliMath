@@ -1,0 +1,5 @@
+{
+  "modulations": ["BPSK", "QPSK"],
+  "jammers": ["CW", "pulsed", "broadband", "sweep"],
+  "metrics": ["SNR", "BER", "PER"]
+}
