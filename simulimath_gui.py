@@ -23,7 +23,24 @@ from tkinter import PhotoImage
 # Importar módulos de simulación
 from sim.core import generate_bits, bpsk_mod, add_awgn, bpsk_demod, ber
 from sim.jammer import jammer_cw, jammer_pulsed, jammer_broadband, jammer_sweep, jammer_chirp, jammer_multitone
-from sim.metrics import empirical_snr, packet_error_rate
+from sim.metrics import empirical_snr, packet_error_rate, empirical_sinr
+from sim.quality import (
+    overall_quality,
+    classify_ber,
+    classify_snr,
+    get_quality_indicator,
+    QUALITY_COLORS,
+    BER_THRESHOLDS,
+    SNR_THRESHOLDS,
+    PER_THRESHOLDS,
+)
+from sim.interference import (
+    calculate_jammer_impact,
+    signal_to_interference_ratio,
+    jammer_to_signal_ratio,
+    interference_severity,
+)
+from sim.theory import get_theory_text, get_all_topics, THEORY_INFO
 
 class SimuliMathApp(tk.Tk):
     def __init__(self):
@@ -49,6 +66,34 @@ class SimuliMathApp(tk.Tk):
             "fstop": 2000.0,
             "sweep_rate": 1.0,
             "seed": 123,
+            "freqs": [1000.0, 2000.0, 3000.0],
+            "p_signal_dbm": 10.0,
+            "p_jammer_dbm": 0.0,
+            "d_signal_m": 100.0,
+            "d_jammer_m": 50.0,
+            "frequency_hz": 2.4e9,
+            "bandwidth_hz": 1e6,
+            "path_loss_exp": 2.0,
+            "quality_thresholds": {
+                "ber": {
+                    "excellent": BER_THRESHOLDS["excellent"],
+                    "good": BER_THRESHOLDS["good"],
+                    "fair": BER_THRESHOLDS["fair"],
+                    "poor": BER_THRESHOLDS["poor"],
+                },
+                "snr": {
+                    "excellent": SNR_THRESHOLDS["excellent"],
+                    "good": SNR_THRESHOLDS["good"],
+                    "fair": SNR_THRESHOLDS["fair"],
+                    "poor": SNR_THRESHOLDS["poor"],
+                },
+                "per": {
+                    "excellent": PER_THRESHOLDS["excellent"],
+                    "good": PER_THRESHOLDS["good"],
+                    "fair": PER_THRESHOLDS["fair"],
+                    "poor": PER_THRESHOLDS["poor"],
+                },
+            },
         }
         # Paleta y estilos
         self.colors = {
@@ -61,6 +106,7 @@ class SimuliMathApp(tk.Tk):
         }
         # cargar configuraciones (si existen) antes de configurar estilo
         self._load_settings()
+        self._apply_quality_thresholds(self.params.get("quality_thresholds"))
         self._configure_style()
         # Construir UI después de definir params
         self._build_menu()
@@ -130,6 +176,7 @@ class SimuliMathApp(tk.Tk):
         # Menú Configuración (avanzada)
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(label="Parámetros...", command=self._open_settings)
+        settings_menu.add_command(label="Umbrales de calidad...", command=self._open_quality_thresholds)
         settings_menu.add_command(label="Tema: Claro/Oscuro", command=self._toggle_theme)
         settings_menu.add_command(label="Rutas por defecto", command=self._open_paths_settings)
         settings_menu.add_command(label="Registro/Logging", command=self._open_logging_settings)
@@ -297,6 +344,86 @@ class SimuliMathApp(tk.Tk):
         settings_window.grab_set()
         self.wait_window(settings_window)
 
+    def _apply_quality_thresholds(self, thresholds: dict | None):
+        """Aplica umbrales de calidad a los módulos de clasificación."""
+        if not thresholds:
+            return
+
+        ber = thresholds.get("ber", {})
+        snr = thresholds.get("snr", {})
+        per = thresholds.get("per", {})
+
+        for key in ("excellent", "good", "fair", "poor"):
+            if key in ber:
+                BER_THRESHOLDS[key] = float(ber[key])
+            if key in snr:
+                SNR_THRESHOLDS[key] = float(snr[key])
+            if key in per:
+                PER_THRESHOLDS[key] = float(per[key])
+
+    def _open_quality_thresholds(self):
+        """Permite editar umbrales de clasificación desde la UI."""
+        w = tk.Toplevel(self)
+        w.title("Umbrales de calidad")
+        w.geometry("420x420")
+        w.configure(bg=self.colors["bg"])
+
+        ttk.Label(w, text="Editar umbrales de clasificación", style="Label.TLabel").pack(pady=10)
+
+        def make_section(title, defaults):
+            frame = ttk.LabelFrame(w, text=title, style="Label.TLabel")
+            frame.pack(fill=tk.X, padx=10, pady=6)
+            vars_map = {}
+            for key in ("excellent", "good", "fair", "poor"):
+                row = ttk.Frame(frame, style="Tab.TFrame")
+                row.pack(fill=tk.X, padx=6, pady=2)
+                ttk.Label(row, text=key.capitalize(), style="Label.TLabel", width=10).pack(side=tk.LEFT)
+                var = tk.DoubleVar(value=float(defaults.get(key, 0)))
+                ttk.Entry(row, textvariable=var, width=12).pack(side=tk.LEFT)
+                vars_map[key] = var
+            return vars_map
+
+        ber_vars = make_section("BER (menor es mejor)", BER_THRESHOLDS)
+        snr_vars = make_section("SNR (mayor es mejor)", SNR_THRESHOLDS)
+        per_vars = make_section("PER (menor es mejor)", PER_THRESHOLDS)
+
+        def _save():
+            try:
+                ber_vals = {k: float(v.get()) for k, v in ber_vars.items()}
+                snr_vals = {k: float(v.get()) for k, v in snr_vars.items()}
+                per_vals = {k: float(v.get()) for k, v in per_vars.items()}
+            except ValueError:
+                messagebox.showerror("Error", "Umbrales inválidos")
+                return
+
+            if not (0 < ber_vals["excellent"] < ber_vals["good"] < ber_vals["fair"] < ber_vals["poor"] < 1.0):
+                messagebox.showerror("Error", "BER debe cumplir: excellent < good < fair < poor < 1")
+                return
+            if not (0 < per_vals["excellent"] < per_vals["good"] < per_vals["fair"] < per_vals["poor"] < 1.0):
+                messagebox.showerror("Error", "PER debe cumplir: excellent < good < fair < poor < 1")
+                return
+            if not (snr_vals["excellent"] > snr_vals["good"] > snr_vals["fair"] > snr_vals["poor"]):
+                messagebox.showerror("Error", "SNR debe cumplir: excellent > good > fair > poor")
+                return
+
+            thresholds = {
+                "ber": ber_vals,
+                "snr": snr_vals,
+                "per": per_vals,
+            }
+            self._apply_quality_thresholds(thresholds)
+            self.params["quality_thresholds"] = thresholds
+            self._save_settings()
+            messagebox.showinfo("Umbrales", "Umbrales actualizados")
+            w.destroy()
+
+        ttk.Button(w, text="Guardar", style="Accent.TButton", command=_save, width=16).pack(pady=10)
+        ttk.Button(w, text="Cancelar", command=w.destroy, width=16).pack()
+
+        w.transient(self)
+        w.grab_set()
+        self.wait_window(w)
+
     def _build_layout(self):
         self.configure(bg=self.colors["bg"])
         main = ttk.Frame(self, style="Main.TFrame")
@@ -351,6 +478,12 @@ class SimuliMathApp(tk.Tk):
 
         # Tab experimentos
         self._add_experiment_tab(content)
+
+        # Tab fundamentos teóricos
+        self._add_theory_tab(content)
+
+        # Tab análisis de interferencia
+        self._add_interference_analysis_tab(content)
 
         # Habilitar zoom y selección en gráficos
         self._enable_zoom_and_selection()
@@ -485,6 +618,7 @@ class SimuliMathApp(tk.Tk):
         ttk.Button(parent, text="Probar jammer", style="Accent.TButton", command=self.run_jammer, width=20).pack(anchor=tk.W)
         ttk.Button(parent, text="Guardar métricas (CSV)", style="TButton", command=self.save_metrics_csv, width=20).pack(anchor=tk.W, pady=(8,0))
         ttk.Button(parent, text="Guardar gráfica (PNG)", style="TButton", command=self.save_plot_png, width=20).pack(anchor=tk.W)
+        ttk.Button(parent, text="Guardar reporte (TXT)", style="TButton", command=self.save_report_txt, width=20).pack(anchor=tk.W, pady=(8, 0))
 
         # --- Exportar resultados ---
         self._add_export_options(parent)
@@ -492,6 +626,64 @@ class SimuliMathApp(tk.Tk):
         ttk.Label(parent, text="Salida", style="Label.TLabel").pack(anchor=tk.W, pady=(12,0))
         self.output_var = tk.StringVar(value="Listo")
         ttk.Label(parent, textvariable=self.output_var, wraplength=200, style="Output.TLabel").pack(anchor=tk.W)
+
+        # --- Panel de indicadores de calidad ---
+        self._build_quality_panel(parent)
+
+        # --- Panel de interferencia ---
+        self._build_interference_panel(parent)
+
+        # --- Cálculo teórico de interferencia ---
+        self._build_interference_controls(parent)
+
+    def _build_interference_controls(self, parent):
+        """Controles para cálculo teórico de interferencia."""
+        frame = ttk.LabelFrame(parent, text="⚡ Cálculo de Interferencia (teórico)", style="Label.TLabel")
+        frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Label(frame, text="Potencia señal TX (dBm)", style="Label.TLabel").pack(anchor=tk.W, padx=6, pady=(4, 0))
+        self.p_signal_dbm_var = tk.DoubleVar(value=self.params["p_signal_dbm"])
+        p_signal_entry = ttk.Entry(frame, textvariable=self.p_signal_dbm_var, width=12)
+        p_signal_entry.pack(anchor=tk.W, padx=6)
+        self._add_tooltips(p_signal_entry, "Potencia de la señal deseada en dBm")
+
+        ttk.Label(frame, text="Potencia jammer TX (dBm)", style="Label.TLabel").pack(anchor=tk.W, padx=6, pady=(4, 0))
+        self.p_jammer_dbm_var = tk.DoubleVar(value=self.params["p_jammer_dbm"])
+        p_jammer_entry = ttk.Entry(frame, textvariable=self.p_jammer_dbm_var, width=12)
+        p_jammer_entry.pack(anchor=tk.W, padx=6)
+        self._add_tooltips(p_jammer_entry, "Potencia del interferente/jammer en dBm")
+
+        ttk.Label(frame, text="Distancia TX-RX (m)", style="Label.TLabel").pack(anchor=tk.W, padx=6, pady=(4, 0))
+        self.d_signal_var = tk.DoubleVar(value=self.params["d_signal_m"])
+        d_signal_entry = ttk.Entry(frame, textvariable=self.d_signal_var, width=12)
+        d_signal_entry.pack(anchor=tk.W, padx=6)
+        self._add_tooltips(d_signal_entry, "Distancia entre transmisor y receptor")
+
+        ttk.Label(frame, text="Distancia Jammer-RX (m)", style="Label.TLabel").pack(anchor=tk.W, padx=6, pady=(4, 0))
+        self.d_jammer_var = tk.DoubleVar(value=self.params["d_jammer_m"])
+        d_jammer_entry = ttk.Entry(frame, textvariable=self.d_jammer_var, width=12)
+        d_jammer_entry.pack(anchor=tk.W, padx=6)
+        self._add_tooltips(d_jammer_entry, "Distancia entre jammer e interferido")
+
+        ttk.Label(frame, text="Frecuencia (Hz)", style="Label.TLabel").pack(anchor=tk.W, padx=6, pady=(4, 0))
+        self.frequency_var = tk.DoubleVar(value=self.params["frequency_hz"])
+        freq_entry = ttk.Entry(frame, textvariable=self.frequency_var, width=12)
+        freq_entry.pack(anchor=tk.W, padx=6)
+        self._add_tooltips(freq_entry, "Frecuencia de operación en Hz")
+
+        ttk.Label(frame, text="Ancho de banda (Hz)", style="Label.TLabel").pack(anchor=tk.W, padx=6, pady=(4, 0))
+        self.bandwidth_if_var = tk.DoubleVar(value=self.params["bandwidth_hz"])
+        bw_entry = ttk.Entry(frame, textvariable=self.bandwidth_if_var, width=12)
+        bw_entry.pack(anchor=tk.W, padx=6)
+        self._add_tooltips(bw_entry, "Ancho de banda del receptor")
+
+        ttk.Label(frame, text="Exponente pérdida (n)", style="Label.TLabel").pack(anchor=tk.W, padx=6, pady=(4, 0))
+        self.path_loss_exp_var = tk.DoubleVar(value=self.params["path_loss_exp"])
+        n_entry = ttk.Entry(frame, textvariable=self.path_loss_exp_var, width=12)
+        n_entry.pack(anchor=tk.W, padx=6)
+        self._add_tooltips(n_entry, "Exponente de pérdida de trayectoria")
+
+        ttk.Button(frame, text="Calcular interferencia", style="Accent.TButton", command=self._calculate_interference_theoretical, width=20).pack(anchor=tk.W, padx=6, pady=8)
 
     def _add_jammer_controls(self, parent):
         """Añade controles específicos para los jammers."""
@@ -566,12 +758,122 @@ class SimuliMathApp(tk.Tk):
             ttk.Entry(self.jammer_frame, textvariable=self.f1_var, width=10).pack(anchor=tk.W)
         if jam == "Multitone":
             ttk.Label(self.jammer_frame, text="Frecuencias (separadas por comas)", style="Label.TLabel").pack(anchor=tk.W)
-            self.freqs_var = tk.StringVar(value="1000,2000,3000")
+            freqs_default = ",".join(str(f) for f in self.params.get("freqs", [1000.0, 2000.0, 3000.0]))
+            self.freqs_var = tk.StringVar(value=freqs_default)
             ttk.Entry(self.jammer_frame, textvariable=self.freqs_var, width=30).pack(anchor=tk.W)
 
     def _update_jammer_controls(self):
         # Reconstruye los controles específicos del jammer en el frame correspondiente
         self._build_jammer_controls()
+
+    def _sync_jammer_params(self):
+        """Sincroniza parámetros del jammer desde la UI hacia self.params."""
+        if not self._validate_jammer_inputs():
+            raise ValueError("Parámetros de jammer inválidos")
+        if hasattr(self, "aj_var"):
+            self.params["Aj"] = float(self.aj_var.get())
+        if hasattr(self, "fj_var"):
+            self.params["fj"] = float(self.fj_var.get())
+        if hasattr(self, "duty_var"):
+            self.params["duty"] = float(self.duty_var.get())
+        if hasattr(self, "prf_var"):
+            self.params["prf"] = float(self.prf_var.get())
+        if hasattr(self, "bandwidth_var") and self.jam_var.get() == "Broadband":
+            self.params["bandwidth"] = float(self.bandwidth_var.get())
+        if hasattr(self, "fstart_var"):
+            self.params["fstart"] = float(self.fstart_var.get())
+        if hasattr(self, "fstop_var"):
+            self.params["fstop"] = float(self.fstop_var.get())
+        if hasattr(self, "sweep_rate_var"):
+            self.params["sweep_rate"] = float(self.sweep_rate_var.get())
+        if hasattr(self, "f0_var"):
+            self.params["fstart"] = float(self.f0_var.get())
+        if hasattr(self, "f1_var"):
+            self.params["fstop"] = float(self.f1_var.get())
+        if hasattr(self, "freqs_var"):
+            raw = self.freqs_var.get()
+            try:
+                freqs = [float(x.strip()) for x in raw.split(",") if x.strip()]
+            except ValueError:
+                messagebox.showerror("Error", "Frecuencias inválidas. Usa valores numéricos separados por comas.")
+                freqs = [1000.0, 2000.0, 3000.0]
+            if not freqs:
+                messagebox.showerror("Error", "La lista de frecuencias no puede estar vacía.")
+                freqs = [1000.0, 2000.0, 3000.0]
+            if any(f <= 0 for f in freqs):
+                messagebox.showerror("Error", "Todas las frecuencias deben ser > 0.")
+                freqs = [f for f in freqs if f > 0] or [1000.0, 2000.0, 3000.0]
+            self.params["freqs"] = freqs
+
+    def _validate_jammer_inputs(self) -> bool:
+        """Valida rangos físicos de parámetros de jammer."""
+        jam = self.jam_var.get()
+        errors = []
+        if hasattr(self, "aj_var"):
+            try:
+                aj = float(self.aj_var.get())
+                if aj <= 0:
+                    errors.append("Amplitud (Aj) debe ser > 0.")
+            except ValueError:
+                errors.append("Amplitud (Aj) inválida.")
+        if hasattr(self, "fj_var"):
+            try:
+                fj = float(self.fj_var.get())
+                if fj <= 0:
+                    errors.append("Frecuencia (fj) debe ser > 0.")
+            except ValueError:
+                errors.append("Frecuencia (fj) inválida.")
+        if jam == "Pulsed":
+            try:
+                duty = float(self.duty_var.get())
+                if duty < 0 or duty > 1:
+                    errors.append("Duty cycle debe estar entre 0 y 1.")
+            except ValueError:
+                errors.append("Duty cycle inválido.")
+            try:
+                prf = float(self.prf_var.get())
+                if prf <= 0:
+                    errors.append("PRF debe ser > 0.")
+            except ValueError:
+                errors.append("PRF inválido.")
+        if jam == "Broadband":
+            try:
+                bw = float(self.bandwidth_var.get())
+                if bw <= 0:
+                    errors.append("Ancho de banda debe ser > 0.")
+            except ValueError:
+                errors.append("Ancho de banda inválido.")
+        if jam == "Sweep":
+            try:
+                fstart = float(self.fstart_var.get())
+                fstop = float(self.fstop_var.get())
+                if fstart <= 0 or fstop <= 0:
+                    errors.append("fstart y fstop deben ser > 0.")
+                if fstart >= fstop:
+                    errors.append("fstart debe ser menor que fstop.")
+            except ValueError:
+                errors.append("fstart/fstop inválidos.")
+            try:
+                rate = float(self.sweep_rate_var.get())
+                if rate <= 0:
+                    errors.append("Sweep rate debe ser > 0.")
+            except ValueError:
+                errors.append("Sweep rate inválido.")
+        if jam == "Chirp":
+            try:
+                f0 = float(self.f0_var.get())
+                f1 = float(self.f1_var.get())
+                if f0 <= 0 or f1 <= 0:
+                    errors.append("Frecuencias de chirp deben ser > 0.")
+                if f0 >= f1:
+                    errors.append("Frecuencia inicial debe ser menor que final.")
+            except ValueError:
+                errors.append("Frecuencias de chirp inválidas.")
+
+        if errors:
+            messagebox.showerror("Error", "\n".join(errors))
+            return False
+        return True
 
     def run_simulation(self):
         try:
@@ -588,6 +890,14 @@ class SimuliMathApp(tk.Tk):
         if snr_db < -20 or snr_db > 60:
             messagebox.showerror("Error", "SNR fuera de rango razonable (-20 a 60 dB)")
             return
+        if seed < 0:
+            messagebox.showerror("Error", "La semilla RNG debe ser un entero no negativo")
+            return
+
+        try:
+            self._sync_jammer_params()
+        except ValueError:
+            return
 
         bits = generate_bits(n_bits, seed=seed)
         symbols = bpsk_mod(bits)
@@ -598,6 +908,23 @@ class SimuliMathApp(tk.Tk):
         ber_val = ber(bits, bits_rx)
         snr_emp = empirical_snr(symbols, rx - symbols)
         per_val = packet_error_rate(bits, bits_rx, packet_size=max(1, n_bits//10))
+
+        noise = rx - tx
+        sinr_emp = empirical_sinr(symbols, jam, noise)
+
+        def power_db(x):
+            p = np.mean(np.abs(x) ** 2)
+            if p <= 0:
+                return float("-inf")
+            return 10 * np.log10(p)
+
+        p_signal_db = power_db(symbols)
+        p_interf_db = power_db(jam)
+        p_noise_db = power_db(noise)
+
+        sir_db = signal_to_interference_ratio(p_signal_db, p_interf_db) if np.isfinite(p_interf_db) else float("inf")
+        jsr_db = jammer_to_signal_ratio(p_interf_db, p_signal_db) if np.isfinite(p_interf_db) else float("-inf")
+        score, severity, description = interference_severity(sir_db, sinr_emp)
 
         # Graficar
         self.ax_time.clear()
@@ -621,11 +948,32 @@ class SimuliMathApp(tk.Tk):
             "BER": ber_val,
             "PER": per_val,
             "SNR_emp_dB": snr_emp,
+            "SINR_emp_dB": sinr_emp,
+            "SIR_dB": sir_db,
+            "JSR_dB": jsr_db,
+            "Interf_score": score,
+            "Interf_level": severity,
             "n_bits": n_bits,
             "snr_db": snr_db,
             "jammer": self.jam_var.get(),
         }
-        self.output_var.set(f"BER={ber_val:.4e} | PER={per_val:.4f} | SNR_emp={snr_emp:.2f} dB")
+        self.output_var.set(
+            f"BER={ber_val:.4e} | PER={per_val:.4f} | SNR_emp={snr_emp:.2f} dB | SINR={sinr_emp:.2f} dB"
+        )
+
+        # Actualizar indicadores de calidad
+        self._update_quality_indicators(ber_val, snr_emp, per_val)
+
+        # Actualizar indicadores de interferencia
+        self._update_interference_indicators(
+            sir_db,
+            sinr_emp,
+            jsr_db,
+            score,
+            severity,
+            description,
+            "Empírico",
+        )
 
     def _build_jammer(self, length):
         fs = max(2*int(self.params["fstop"]) if "fstop" in self.params else 10000, 2000)
@@ -647,6 +995,10 @@ class SimuliMathApp(tk.Tk):
         return np.zeros(length)
 
     def run_jammer(self):
+        try:
+            self._sync_jammer_params()
+        except ValueError:
+            return
         length = 2000
         fs = 10000
         jam = self._build_jammer(length)
@@ -670,7 +1022,19 @@ class SimuliMathApp(tk.Tk):
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All", "*.*")])
         if not path:
             return
-        header = ["n_bits", "snr_db", "jammer", "BER", "PER", "SNR_emp_dB"]
+        header = [
+            "n_bits",
+            "snr_db",
+            "jammer",
+            "BER",
+            "PER",
+            "SNR_emp_dB",
+            "SINR_emp_dB",
+            "SIR_dB",
+            "JSR_dB",
+            "Interf_score",
+            "Interf_level",
+        ]
         values = [self.last_metrics.get(k, "") for k in header]
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -689,6 +1053,73 @@ class SimuliMathApp(tk.Tk):
             self.output_var.set(f"Gráfica guardada en {os.path.basename(path)}")
         except OSError as exc:
             messagebox.showerror("Error", f"No se pudo guardar la imagen: {exc}")
+
+    def save_report_txt(self):
+        if not hasattr(self, "last_metrics"):
+            messagebox.showinfo("Info", "Primero ejecuta una simulación para generar métricas")
+            return
+
+        path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("TXT", "*.txt"), ("All", "*.*")])
+        if not path:
+            return
+
+        metrics = self.last_metrics
+        quality = overall_quality(metrics.get("BER", 0.0), metrics.get("SNR_emp_dB", 0.0), metrics.get("PER", 0.0))
+
+        report_lines = [
+            "SIMULIMATH - REPORTE DE RESULTADOS",
+            "==================================",
+            f"Bits: {metrics.get('n_bits', '---')}",
+            f"SNR (config): {metrics.get('snr_db', '---')} dB",
+            f"Jammer: {metrics.get('jammer', '---')}",
+            "",
+            "MÉTRICAS EMPÍRICAS",
+            "------------------",
+            f"BER: {metrics.get('BER', 0.0):.4e}",
+            f"PER: {metrics.get('PER', 0.0):.4f}",
+            f"SNR empírico: {metrics.get('SNR_emp_dB', 0.0):.2f} dB",
+            f"SINR empírico: {metrics.get('SINR_emp_dB', 0.0):.2f} dB",
+            f"SIR: {metrics.get('SIR_dB', 0.0):.2f} dB",
+            f"JSR: {metrics.get('JSR_dB', 0.0):.2f} dB",
+            "",
+            "CLASIFICACIÓN DE CALIDAD",
+            "-------------------------",
+            f"Estado: {quality.get('description', '---')}",
+            f"Score: {quality.get('score', 0)}/100",
+        ]
+
+        recommendations = quality.get("recommendations", [])
+        if recommendations:
+            report_lines.append("Recomendaciones:")
+            report_lines.extend([f"- {rec}" for rec in recommendations])
+
+        if "Interf_level" in metrics:
+            report_lines.extend([
+                "",
+                "SEVERIDAD DE INTERFERENCIA",
+                "---------------------------",
+                f"Nivel: {metrics.get('Interf_level', '---')}",
+                f"Score: {metrics.get('Interf_score', 0)}/100",
+            ])
+
+        report_lines.extend([
+            "",
+            "Parámetros teóricos usados (si aplica):",
+            f"P señal TX (dBm): {self.params.get('p_signal_dbm', '---')}",
+            f"P jammer TX (dBm): {self.params.get('p_jammer_dbm', '---')}",
+            f"Distancia TX-RX (m): {self.params.get('d_signal_m', '---')}",
+            f"Distancia Jammer-RX (m): {self.params.get('d_jammer_m', '---')}",
+            f"Frecuencia (Hz): {self.params.get('frequency_hz', '---')}",
+            f"Ancho de banda (Hz): {self.params.get('bandwidth_hz', '---')}",
+            f"Exponente pérdida (n): {self.params.get('path_loss_exp', '---')}",
+        ])
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(report_lines))
+            self.output_var.set(f"Reporte guardado en {os.path.basename(path)}")
+        except OSError as exc:
+            messagebox.showerror("Error", f"No se pudo guardar el reporte: {exc}")
 
     def _add_export_options(self, parent):
         """Añade opciones para exportar resultados en diferentes formatos."""
@@ -841,6 +1272,16 @@ class SimuliMathApp(tk.Tk):
             messagebox.showerror("Error", "Parámetros numéricos inválidos para el experimento")
             return
 
+        if n_bits <= 0 or n_bits > 2_000_000:
+            messagebox.showerror("Error", "El número de bits debe estar entre 1 y 2,000,000")
+            return
+        if snr_db < -20 or snr_db > 60:
+            messagebox.showerror("Error", "SNR fuera de rango razonable (-20 a 60 dB)")
+            return
+        if n_runs <= 0 or n_runs > 1000:
+            messagebox.showerror("Error", "Número de repeticiones fuera de rango (1 a 1000)")
+            return
+
         if n_bits <= 0 or n_runs <= 0:
             messagebox.showerror("Error", "Número de bits y repeticiones deben ser mayores que 0")
             return
@@ -901,6 +1342,416 @@ class SimuliMathApp(tk.Tk):
             except Exception:
                 pass
         messagebox.showinfo("Parámetros", "Parámetros reseteados a valores predeterminados.")
+
+    def _add_theory_tab(self, content):
+        """Añade la pestaña de fundamentos teóricos con información educativa."""
+        tab_theory = ttk.Frame(content, style="Tab.TFrame")
+        content.add(tab_theory, text="Fundamentos Teóricos")
+
+        # Contenedor principal con scroll
+        canvas = tk.Canvas(tab_theory, bg=self.colors["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(tab_theory, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas, style="Tab.TFrame")
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Título principal
+        title_frame = ttk.Frame(scrollable_frame, style="Tab.TFrame")
+        title_frame.pack(fill=tk.X, padx=20, pady=10)
+        ttk.Label(title_frame, text="📡 FUNDAMENTOS DE ONDAS Y ELECTROMAGNETISMO",
+                 font=("Segoe UI", 14, "bold"), style="Label.TLabel").pack(anchor=tk.W)
+        ttk.Label(title_frame, text="Conceptos clave para entender las interferencias en comunicaciones",
+                 style="Label.TLabel").pack(anchor=tk.W)
+
+        # Selector de tema
+        topic_frame = ttk.Frame(scrollable_frame, style="Tab.TFrame")
+        topic_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        ttk.Label(topic_frame, text="Seleccionar tema:", style="Label.TLabel").pack(side=tk.LEFT, padx=(0, 10))
+        self.theory_topic_var = tk.StringVar(value="electromagnetic_waves")
+        topic_combo = ttk.Combobox(topic_frame, textvariable=self.theory_topic_var,
+                                   values=["electromagnetic_waves", "interference", "modulation"],
+                                   state="readonly", width=25)
+        topic_combo.pack(side=tk.LEFT)
+
+        # Área de texto para mostrar contenido
+        text_frame = ttk.Frame(scrollable_frame, style="Tab.TFrame")
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        self.theory_text = tk.Text(text_frame, wrap=tk.WORD, bg=self.colors["panel"],
+                                   fg=self.colors["text"], font=("Consolas", 10),
+                                   padx=15, pady=15, height=25)
+        self.theory_text.pack(fill=tk.BOTH, expand=True)
+
+        # Cargar contenido inicial
+        self._update_theory_content()
+
+        # Actualizar cuando cambia el tema
+        topic_combo.bind("<<ComboboxSelected>>", lambda e: self._update_theory_content())
+
+        # Sección de fórmulas clave
+        formula_frame = ttk.LabelFrame(scrollable_frame, text="Fórmulas Clave", style="Label.TLabel")
+        formula_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        formulas = [
+            ("Longitud de onda:", "λ = c / f   (donde c = 3×10⁸ m/s)"),
+            ("Pérdida espacio libre:", "FSPL = 20log₁₀(d) + 20log₁₀(f) + 20log₁₀(4π/c)"),
+            ("BER BPSK:", "Pe = Q(√(2·Eb/N0))"),
+            ("Capacidad canal:", "C = B·log₂(1 + SNR)"),
+        ]
+
+        for name, formula in formulas:
+            row = ttk.Frame(formula_frame, style="Tab.TFrame")
+            row.pack(fill=tk.X, padx=10, pady=3)
+            ttk.Label(row, text=name, style="Label.TLabel", width=20).pack(side=tk.LEFT)
+            ttk.Label(row, text=formula, font=("Consolas", 10), style="Label.TLabel").pack(side=tk.LEFT)
+
+    def _add_interference_analysis_tab(self, content):
+        """Añade una pestaña para analizar SIR/SINR vs distancia/potencia."""
+        tab_analysis = ttk.Frame(content, style="Tab.TFrame")
+        content.add(tab_analysis, text="Análisis Interferencia")
+
+        controls = ttk.Frame(tab_analysis, padding=10, style="Controls.TFrame")
+        controls.pack(side=tk.LEFT, fill=tk.Y)
+
+        plot_area = ttk.Frame(tab_analysis, style="Tab.TFrame")
+        plot_area.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        ttk.Label(controls, text="Barrido de parámetros", style="Heading.TLabel").pack(anchor=tk.W, pady=(0, 6))
+
+        self.sweep_var = tk.StringVar(value="d_jammer")
+        ttk.Label(controls, text="Variable", style="Label.TLabel").pack(anchor=tk.W)
+        ttk.Combobox(
+            controls,
+            textvariable=self.sweep_var,
+            values=["d_jammer", "d_signal", "p_jammer"],
+            state="readonly",
+            width=12,
+        ).pack(anchor=tk.W)
+
+        self.sweep_min_var = tk.DoubleVar(value=10.0)
+        self.sweep_max_var = tk.DoubleVar(value=500.0)
+        self.sweep_steps_var = tk.IntVar(value=25)
+
+        ttk.Label(controls, text="Mínimo", style="Label.TLabel").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Entry(controls, textvariable=self.sweep_min_var, width=12).pack(anchor=tk.W)
+
+        ttk.Label(controls, text="Máximo", style="Label.TLabel").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Entry(controls, textvariable=self.sweep_max_var, width=12).pack(anchor=tk.W)
+
+        ttk.Label(controls, text="Pasos", style="Label.TLabel").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Entry(controls, textvariable=self.sweep_steps_var, width=12).pack(anchor=tk.W)
+
+        ttk.Button(
+            controls,
+            text="Generar gráfica",
+            style="Accent.TButton",
+            command=self._run_interference_sweep,
+            width=18,
+        ).pack(anchor=tk.W, pady=10)
+
+        self.sweep_status_var = tk.StringVar(value="Listo")
+        ttk.Label(
+            controls,
+            textvariable=self.sweep_status_var,
+            wraplength=180,
+            style="Output.TLabel",
+        ).pack(anchor=tk.W)
+
+        self.fig_sweep = Figure(figsize=(7, 5), dpi=100)
+        self.ax_sweep = self.fig_sweep.add_subplot(1, 1, 1)
+        self.canvas_sweep = FigureCanvasTkAgg(self.fig_sweep, master=plot_area)
+        self.canvas_sweep.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _get_theoretical_params(self) -> dict:
+        """Obtiene parámetros teóricos desde la UI o valores por defecto."""
+        p_signal = float(self.p_signal_dbm_var.get()) if hasattr(self, "p_signal_dbm_var") else self.params["p_signal_dbm"]
+        p_jammer = float(self.p_jammer_dbm_var.get()) if hasattr(self, "p_jammer_dbm_var") else self.params["p_jammer_dbm"]
+        d_signal = float(self.d_signal_var.get()) if hasattr(self, "d_signal_var") else self.params["d_signal_m"]
+        d_jammer = float(self.d_jammer_var.get()) if hasattr(self, "d_jammer_var") else self.params["d_jammer_m"]
+        frequency = float(self.frequency_var.get()) if hasattr(self, "frequency_var") else self.params["frequency_hz"]
+        bandwidth = float(self.bandwidth_if_var.get()) if hasattr(self, "bandwidth_if_var") else self.params["bandwidth_hz"]
+        path_loss_exp = float(self.path_loss_exp_var.get()) if hasattr(self, "path_loss_exp_var") else self.params["path_loss_exp"]
+
+        return {
+            "p_signal": p_signal,
+            "p_jammer": p_jammer,
+            "d_signal": d_signal,
+            "d_jammer": d_jammer,
+            "frequency": frequency,
+            "bandwidth": bandwidth,
+            "path_loss_exp": path_loss_exp,
+        }
+
+    def _run_interference_sweep(self):
+        """Genera gráfica de SIR/SINR vs variable seleccionada."""
+        try:
+            vmin = float(self.sweep_min_var.get())
+            vmax = float(self.sweep_max_var.get())
+            steps = int(self.sweep_steps_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Valores de barrido inválidos")
+            return
+
+        if steps < 2:
+            messagebox.showerror("Error", "Pasos debe ser >= 2")
+            return
+        if vmin >= vmax:
+            messagebox.showerror("Error", "Mínimo debe ser menor que máximo")
+            return
+        if vmin <= 0 and self.sweep_var.get() in ("d_jammer", "d_signal"):
+            messagebox.showerror("Error", "Las distancias deben ser > 0")
+            return
+
+        base = self._get_theoretical_params()
+        x = np.linspace(vmin, vmax, steps)
+        sir_vals = []
+        sinr_vals = []
+        jsr_vals = []
+
+        for value in x:
+            params = dict(base)
+            if self.sweep_var.get() == "d_jammer":
+                params["d_jammer"] = value
+            elif self.sweep_var.get() == "d_signal":
+                params["d_signal"] = value
+            else:
+                params["p_jammer"] = value
+
+            impact = calculate_jammer_impact(
+                p_signal=params["p_signal"],
+                p_jammer=params["p_jammer"],
+                d_signal=params["d_signal"],
+                d_jammer=params["d_jammer"],
+                frequency=params["frequency"],
+                bandwidth=params["bandwidth"],
+                path_loss_exponent=params["path_loss_exp"],
+            )
+            sir_vals.append(impact["sir_db"])
+            sinr_vals.append(impact["sinr_db"])
+            jsr_vals.append(impact["jsr_db"])
+
+        self.ax_sweep.clear()
+        self.ax_sweep.plot(x, sir_vals, label="SIR (dB)")
+        self.ax_sweep.plot(x, sinr_vals, label="SINR (dB)")
+        self.ax_sweep.plot(x, jsr_vals, label="JSR (dB)", linestyle="--")
+
+        units = "m" if self.sweep_var.get() in ("d_jammer", "d_signal") else "dBm"
+        self.ax_sweep.set_xlabel(f"{self.sweep_var.get()} ({units})")
+        self.ax_sweep.set_ylabel("dB")
+        self.ax_sweep.set_title("SIR / SINR / JSR vs variable")
+        self.ax_sweep.grid(True, alpha=0.3)
+        self.ax_sweep.legend(loc="best")
+
+        self.fig_sweep.tight_layout()
+        self.canvas_sweep.draw()
+
+        self.sweep_status_var.set(
+            f"Barrido {self.sweep_var.get()} [{vmin:.2f}, {vmax:.2f}] ({steps} pasos)"
+        )
+
+    def _update_theory_content(self):
+        """Actualiza el contenido del área de texto con el tema seleccionado."""
+        topic = self.theory_topic_var.get()
+        content = get_theory_text(topic)
+        self.theory_text.config(state=tk.NORMAL)
+        self.theory_text.delete(1.0, tk.END)
+        self.theory_text.insert(tk.END, content)
+        self.theory_text.config(state=tk.DISABLED)
+
+    def _build_quality_panel(self, parent):
+        """Construye el panel de indicadores de calidad de comunicación."""
+        quality_frame = ttk.LabelFrame(parent, text="📊 Estado de Comunicación", style="Label.TLabel")
+        quality_frame.pack(fill=tk.X, pady=(10, 0))
+
+        # Indicador principal
+        self.quality_indicator_label = ttk.Label(quality_frame, text="●  ---",
+                                                  font=("Segoe UI", 12, "bold"),
+                                                  style="Label.TLabel")
+        self.quality_indicator_label.pack(anchor=tk.W, padx=10, pady=5)
+
+        # Barra de calidad
+        self.quality_bar_var = tk.StringVar(value="░░░░░░░░░░  0/100")
+        ttk.Label(quality_frame, textvariable=self.quality_bar_var,
+                 font=("Consolas", 10), style="Label.TLabel").pack(anchor=tk.W, padx=10)
+
+        # Métricas individuales
+        metrics_frame = ttk.Frame(quality_frame, style="Tab.TFrame")
+        metrics_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.metric_ber_var = tk.StringVar(value="BER: ---")
+        self.metric_snr_var = tk.StringVar(value="SNR: ---")
+        self.metric_per_var = tk.StringVar(value="PER: ---")
+
+        ttk.Label(metrics_frame, textvariable=self.metric_ber_var,
+                 style="Output.TLabel").pack(anchor=tk.W)
+        ttk.Label(metrics_frame, textvariable=self.metric_snr_var,
+                 style="Output.TLabel").pack(anchor=tk.W)
+        ttk.Label(metrics_frame, textvariable=self.metric_per_var,
+                 style="Output.TLabel").pack(anchor=tk.W)
+
+        # Recomendaciones
+        self.recommendations_var = tk.StringVar(value="")
+        ttk.Label(quality_frame, textvariable=self.recommendations_var,
+                 wraplength=200, style="Output.TLabel").pack(anchor=tk.W, padx=10, pady=5)
+
+    def _build_interference_panel(self, parent):
+        """Construye el panel de indicadores de interferencia."""
+        interference_frame = ttk.LabelFrame(parent, text="📡 Estado de Interferencia", style="Label.TLabel")
+        interference_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.interference_indicator_label = ttk.Label(interference_frame, text="●  ---",
+                                                      font=("Segoe UI", 11, "bold"),
+                                                      style="Label.TLabel")
+        self.interference_indicator_label.pack(anchor=tk.W, padx=10, pady=5)
+
+        self.interference_score_var = tk.StringVar(value="░░░░░░░░░░  0/100")
+        ttk.Label(interference_frame, textvariable=self.interference_score_var,
+                 font=("Consolas", 10), style="Label.TLabel").pack(anchor=tk.W, padx=10)
+
+        metrics_frame = ttk.Frame(interference_frame, style="Tab.TFrame")
+        metrics_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.metric_sir_var = tk.StringVar(value="SIR: ---")
+        self.metric_sinr_var = tk.StringVar(value="SINR: ---")
+        self.metric_jsr_var = tk.StringVar(value="JSR: ---")
+        self.metric_interf_source_var = tk.StringVar(value="Fuente: ---")
+
+        ttk.Label(metrics_frame, textvariable=self.metric_sir_var,
+                 style="Output.TLabel").pack(anchor=tk.W)
+        ttk.Label(metrics_frame, textvariable=self.metric_sinr_var,
+                 style="Output.TLabel").pack(anchor=tk.W)
+        ttk.Label(metrics_frame, textvariable=self.metric_jsr_var,
+                 style="Output.TLabel").pack(anchor=tk.W)
+        ttk.Label(metrics_frame, textvariable=self.metric_interf_source_var,
+                 style="Output.TLabel").pack(anchor=tk.W)
+
+        self.interference_detail_var = tk.StringVar(value="")
+        ttk.Label(interference_frame, textvariable=self.interference_detail_var,
+                 wraplength=200, style="Output.TLabel").pack(anchor=tk.W, padx=10, pady=5)
+
+    def _update_quality_indicators(self, ber_val, snr_val, per_val=None):
+        """Actualiza los indicadores de calidad basándose en las métricas."""
+        # Obtener evaluación completa
+        quality = overall_quality(ber_val, snr_val, per_val)
+
+        # Actualizar indicador principal
+        emoji_map = {'excellent': '🟢', 'good': '🟡', 'fair': '🟠', 'poor': '🔴', 'critical': '⛔'}
+        emoji = emoji_map.get(quality['category'], '⚪')
+        self.quality_indicator_label.config(
+            text=f"{emoji}  {quality['description'].upper()}"
+        )
+
+        # Actualizar barra de calidad
+        bar = get_quality_indicator(quality['score'])
+        self.quality_bar_var.set(f"{bar}  {quality['score']}/100")
+
+        # Actualizar métricas individuales
+        ber_cat, ber_desc, _ = classify_ber(ber_val)
+        snr_cat, snr_desc, _ = classify_snr(snr_val)
+
+        self.metric_ber_var.set(f"BER: {ber_val:.2e}  →  {ber_desc}")
+        self.metric_snr_var.set(f"SNR: {snr_val:.1f} dB  →  {snr_desc}")
+        if per_val is not None:
+            self.metric_per_var.set(f"PER: {per_val:.2%}  →  {'Aceptable' if per_val < 0.05 else 'Alto'}")
+        else:
+            self.metric_per_var.set("PER: ---")
+
+        # Actualizar recomendaciones
+        recs = quality.get('recommendations', [])
+        self.recommendations_var.set("\n".join(recs[:2]))  # Mostrar máx 2
+
+    def _update_interference_indicators(self, sir_db, sinr_db, jsr_db, score, severity, description, source_label):
+        """Actualiza indicadores de interferencia y severidad."""
+        severity_map = {
+            'none': ('🟢', 'SIN INTERFERENCIA'),
+            'low': ('🟡', 'INTERFERENCIA BAJA'),
+            'moderate': ('🟠', 'INTERFERENCIA MODERADA'),
+            'high': ('🔴', 'INTERFERENCIA ALTA'),
+            'critical': ('⛔', 'INTERFERENCIA CRÍTICA'),
+        }
+        emoji, title = severity_map.get(severity, ('⚪', 'INTERFERENCIA'))
+        self.interference_indicator_label.config(text=f"{emoji}  {title}")
+
+        bar = get_quality_indicator(score)
+        self.interference_score_var.set(f"{bar}  {score}/100")
+
+        self.metric_sir_var.set(f"SIR: {sir_db:.1f} dB")
+        self.metric_sinr_var.set(f"SINR: {sinr_db:.1f} dB")
+        self.metric_jsr_var.set(f"JSR: {jsr_db:.1f} dB")
+        self.metric_interf_source_var.set(f"Fuente: {source_label}")
+        self.interference_detail_var.set(description)
+
+    def _calculate_interference_theoretical(self):
+        """Calcula interferencia teórica a partir de entradas del usuario."""
+        try:
+            p_signal = float(self.p_signal_dbm_var.get())
+            p_jammer = float(self.p_jammer_dbm_var.get())
+            d_signal = float(self.d_signal_var.get())
+            d_jammer = float(self.d_jammer_var.get())
+            frequency = float(self.frequency_var.get())
+            bandwidth = float(self.bandwidth_if_var.get())
+            path_loss_exp = float(self.path_loss_exp_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Parámetros de interferencia inválidos")
+            return
+
+        if d_signal <= 0 or d_jammer <= 0 or frequency <= 0 or bandwidth <= 0:
+            messagebox.showerror("Error", "Distancias, frecuencia y ancho de banda deben ser positivos")
+            return
+        if path_loss_exp < 1.0 or path_loss_exp > 6.0:
+            messagebox.showerror("Error", "Exponente de pérdida debe estar entre 1.0 y 6.0")
+            return
+        if frequency < 1e3 or frequency > 300e9:
+            messagebox.showerror("Error", "Frecuencia fuera de rango (1 kHz a 300 GHz)")
+            return
+        if bandwidth < 1.0 or bandwidth > 1e9:
+            messagebox.showerror("Error", "Ancho de banda fuera de rango (1 Hz a 1 GHz)")
+            return
+
+        impact = calculate_jammer_impact(
+            p_signal=p_signal,
+            p_jammer=p_jammer,
+            d_signal=d_signal,
+            d_jammer=d_jammer,
+            frequency=frequency,
+            bandwidth=bandwidth,
+            path_loss_exponent=path_loss_exp,
+        )
+
+        self.params.update({
+            "p_signal_dbm": p_signal,
+            "p_jammer_dbm": p_jammer,
+            "d_signal_m": d_signal,
+            "d_jammer_m": d_jammer,
+            "frequency_hz": frequency,
+            "bandwidth_hz": bandwidth,
+            "path_loss_exp": path_loss_exp,
+        })
+
+        self._update_interference_indicators(
+            impact["sir_db"],
+            impact["sinr_db"],
+            impact["jsr_db"],
+            impact["severity_score"],
+            impact["severity_level"],
+            impact["severity_description"],
+            "Teórico",
+        )
+
+        self.output_var.set(
+            f"SIR={impact['sir_db']:.1f} dB | SINR={impact['sinr_db']:.1f} dB | JSR={impact['jsr_db']:.1f} dB"
+        )
+
 
 def main():
     app = SimuliMathApp()

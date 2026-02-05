@@ -44,3 +44,30 @@ def spectral_efficiency(snr_db):
     """
     snr_linear = 10**(snr_db / 10)
     return np.log2(1 + snr_linear)
+
+
+def empirical_sinr(signal, interference, noise):
+    """
+    Calcula SINR empírico en dB desde arrays de señal.
+    
+    SINR (Signal-to-Interference-plus-Noise Ratio) es la métrica más
+    completa para evaluar la calidad de una comunicación cuando hay
+    interferencia presente.
+    
+    Parameters:
+        signal (np.ndarray): Señal deseada.
+        interference (np.ndarray): Señal de interferencia.
+        noise (np.ndarray): Ruido.
+        
+    Returns:
+        float: SINR en dB.
+    """
+    p_signal = np.mean(np.abs(signal)**2)
+    p_interference = np.mean(np.abs(interference)**2)
+    p_noise = np.mean(np.abs(noise)**2)
+    
+    if p_interference + p_noise == 0:
+        return float('inf')
+    
+    return 10 * np.log10(p_signal / (p_interference + p_noise))
+
