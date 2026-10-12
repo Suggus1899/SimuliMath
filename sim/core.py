@@ -62,7 +62,10 @@ def qpsk_mod(bits):
     """Modula una secuencia de bits usando QPSK."""
     if len(bits) % 2 != 0:
         raise ValueError("El número de bits debe ser par para QPSK.")
-    symbols = bits.reshape(-1, 2)
+    # Conversión a entero con signo ANTES de operar: con arrays uint8
+    # (p. ej. los de generate_bits), `2*0-1` desborda a 255 (wrap-around)
+    # y corrompe los símbolos resultantes.
+    symbols = np.asarray(bits, dtype=np.int64).reshape(-1, 2)
     return 1/np.sqrt(2) * ((2*symbols[:, 0] - 1) + 1j * (2*symbols[:, 1] - 1))
 
 def qpsk_demod(received):
