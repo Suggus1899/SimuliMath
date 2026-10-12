@@ -106,7 +106,12 @@ class SimuliMathApp(tk.Tk):
         }
         # cargar configuraciones (si existen) antes de configurar estilo
         self._load_settings()
-        self._apply_quality_thresholds(self.params.get("quality_thresholds"))
+        try:
+            self._apply_quality_thresholds(self.params.get("quality_thresholds"))
+        except (ValueError, TypeError):
+            # Umbrales corruptos en settings.json: se ignoran y se usan
+            # los valores por defecto en vez de impedir el arranque.
+            self.params.pop("quality_thresholds", None)
         self._configure_style()
         # Construir UI después de definir params
         self._build_menu()
@@ -568,15 +573,26 @@ class SimuliMathApp(tk.Tk):
 
     # Validación de entradas en tiempo real
     def _validate_entry(self, var, validation_type):
-        """Valida entradas en tiempo real."""
+        """Valida entradas en tiempo real sin romper el callback.
+
+        Se valida la cadena del valor leido: con texto invalido,
+        IntVar.get()/DoubleVar.get() lanzan TclError, y con enteros
+        validos devuelven int (que no tiene .isdigit()).
+        """
         def validate(*args):
-            value = var.get()
-            if validation_type == "int" and not value.isdigit():
-                var.set("0")
+            try:
+                value = var.get()
+            except (tk.TclError, ValueError):
+                # Texto intermedio o invalido: no se toca el campo; el
+                # llamador (run_simulation, experimentos) valida por su cuenta.
+                return
+            if validation_type == "int":
+                if not str(value).lstrip("+-").isdigit():
+                    var.set("0")
             elif validation_type == "float":
                 try:
                     float(value)
-                except ValueError:
+                except (ValueError, TypeError):
                     var.set("0.0")
 
         var.trace_add("write", validate)
@@ -1472,15 +1488,22 @@ class SimuliMathApp(tk.Tk):
         self.canvas_sweep = FigureCanvasTkAgg(self.fig_sweep, master=plot_area)
         self.canvas_sweep.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-    def _get_theoretical_params(self) -> dict:
-        """Obtiene parámetros teóricos desde la UI o valores por defecto."""
-        p_signal = float(self.p_signal_dbm_var.get()) if hasattr(self, "p_signal_dbm_var") else self.params["p_signal_dbm"]
-        p_jammer = float(self.p_jammer_dbm_var.get()) if hasattr(self, "p_jammer_dbm_var") else self.params["p_jammer_dbm"]
-        d_signal = float(self.d_signal_var.get()) if hasattr(self, "d_signal_var") else self.params["d_signal_m"]
-        d_jammer = float(self.d_jammer_var.get()) if hasattr(self, "d_jammer_var") else self.params["d_jammer_m"]
-        frequency = float(self.frequency_var.get()) if hasattr(self, "frequency_var") else self.params["frequency_hz"]
-        bandwidth = float(self.bandwidth_if_var.get()) if hasattr(self, "bandwidth_if_var") else self.params["bandwidth_hz"]
-        path_loss_exp = float(self.path_loss_exp_var.get()) if hasattr(self, "path_loss_exp_var") else self.params["path_loss_exp"]
+    def _get_theoretical_params(self) -> dict | None:
+        """Obtiene parámetros teóricos desde la UI o valores por defecto.
+
+        Devuelve None si alguna entrada no es numerica; el llamador debe
+        mostrar el error al usuario.
+        """
+        try:
+            p_signal = float(self.p_signal_dbm_var.get()) if hasattr(self, "p_signal_dbm_var") else self.params["p_signal_dbm"]
+            p_jammer = float(self.p_jammer_dbm_var.get()) if hasattr(self, "p_jammer_dbm_var") else self.params["p_jammer_dbm"]
+            d_signal = float(self.d_signal_var.get()) if hasattr(self, "d_signal_var") else self.params["d_signal_m"]
+            d_jammer = float(self.d_jammer_var.get()) if hasattr(self, "d_jammer_var") else self.params["d_jammer_m"]
+            frequency = float(self.frequency_var.get()) if hasattr(self, "frequency_var") else self.params["frequency_hz"]
+            bandwidth = float(self.bandwidth_if_var.get()) if hasattr(self, "bandwidth_if_var") else self.params["bandwidth_hz"]
+            path_loss_exp = float(self.path_loss_exp_var.get()) if hasattr(self, "path_loss_exp_var") else self.params["path_loss_exp"]
+        except (ValueError, tk.TclError):
+            return None
 
         return {
             "p_signal": p_signal,
@@ -1513,6 +1536,9 @@ class SimuliMathApp(tk.Tk):
             return
 
         base = self._get_theoretical_params()
+        if base is None:
+            messagebox.showerror("Error", "Parametros teoricos invalidos")
+            return
         x = np.linspace(vmin, vmax, steps)
         sir_vals = []
         sinr_vals = []
