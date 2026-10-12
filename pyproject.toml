@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simulimath"
+version = "0.1.0"
+description = "Simulador académico de interferencias en comunicaciones inalámbricas"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Suggus1899" }]
+dependencies = [
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "matplotlib==3.9.4",
+    "pandas==2.2.3",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.3.4"]
+
+[tool.setuptools.packages.find]
+include = ["sim*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
