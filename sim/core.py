@@ -14,12 +14,20 @@ def bpsk_mod(bits):
     return np.where(bits == 0, -1, 1)
 
 def add_awgn(signal, snr_db, seed=None):
-    """Añade ruido blanco aditivo gaussiano (AWGN) a una señal dada."""
+    """Añade ruido blanco aditivo gaussiano (AWGN) a una señal dada.
+
+    Para senales complejas (QPSK/QAM) genera ruido complejo propio con
+    componentes I/Q independientes de varianza sigma^2/2 cada una.
+    """
     rng = np.random.default_rng(seed)
     snr_linear = 10**(snr_db / 10)
-    power_signal = np.mean(signal**2)
+    power_signal = np.mean(np.abs(signal)**2)
     noise_power = power_signal / snr_linear
-    noise = rng.normal(0, np.sqrt(noise_power), size=signal.shape).astype(signal.dtype)
+    if np.iscomplexobj(signal):
+        sigma = np.sqrt(noise_power / 2)
+        noise = rng.normal(0, sigma, size=signal.shape) + 1j * rng.normal(0, sigma, size=signal.shape)
+    else:
+        noise = rng.normal(0, np.sqrt(noise_power), size=signal.shape).astype(signal.dtype)
     return signal + noise
 
 def bpsk_demod(received):
